@@ -1,4 +1,4 @@
-# 编译 WhalePet.exe（.NET Framework 4.8 自带的 csc，无需安装 SDK）
+﻿# 编译 WhalePet.exe（.NET Framework 4.8 自带的 csc，无需安装 SDK）
 # 产物：dist\WhalePet.exe（素材已嵌入）
 
 $ErrorActionPreference = "Stop"

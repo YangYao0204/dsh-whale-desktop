@@ -1,4 +1,4 @@
-# 从本机已安装的 dsh-whale-widget 插件复制素材到 assets/
+﻿# 从本机已安装的 dsh-whale-widget 插件复制素材到 assets/
 # 这些素材不随仓库分发（见 NOTICE.md），所以构建前必须先跑这个脚本。
 
 param(

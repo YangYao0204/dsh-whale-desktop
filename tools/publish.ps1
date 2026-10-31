@@ -1,4 +1,4 @@
-# 一键发布到 GitHub（需要先装 GitHub CLI 并登录）
+﻿# 一键发布到 GitHub（需要先装 GitHub CLI 并登录）
 #   1) winget install GitHub.cli
 #   2) 重新打开终端，执行  gh auth login
 #   3) 运行本脚本：powershell -ExecutionPolicy Bypass -File tools\publish.ps1 -Visibility public
