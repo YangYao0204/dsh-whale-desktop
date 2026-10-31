@@ -6,6 +6,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -273,6 +274,13 @@ namespace WhalePet
         private bool _peakState;
         private bool _peakCacheValid;
 
+        // 事件音效(插件 v0.4.2):任务结束 cost_a(默认开)、提问 ask_a(默认只冒泡不响)
+        private string _evtWavPath;
+        private string _askWavPath;
+        private bool _taskEndSoundOn = true;
+        private bool _questionSoundOn = false;
+        private DateTime _lastEvtPlay = DateTime.MinValue;
+
         // 2026 年法定节假日（与插件 lib/index.js 的 HOLIDAY_VALLEY 一致，插件注释要求每年 11 月补下一年）
         private static readonly HashSet<string> Holidays = new HashSet<string>(StringComparer.Ordinal)
         {
@@ -364,7 +372,7 @@ namespace WhalePet
             _animTimer.Tick += OnAnimTick;
 
             _pollTimer = new System.Windows.Forms.Timer();
-            _pollTimer.Interval = 80;
+            _pollTimer.Interval = 50;
             _pollTimer.Tick += OnPollTick;
 
             try { _pawOpen = BuildPawCursor(false); _pawClosed = BuildPawCursor(true); } catch { }
@@ -840,7 +848,7 @@ namespace WhalePet
 
         private void DrawBubbleText(Graphics g, float px, float k)
         {
-            float alpha = (_bubbleOpen - 0.08f) / 0.55f;
+            float alpha = (_bubbleOpen - 0.03f) / 0.35f;
             if (alpha <= 0.02f) return;
             if (alpha > 1f) alpha = 1f;
             int a = (int)Math.Round(255 * alpha);
@@ -854,7 +862,7 @@ namespace WhalePet
 
             float gap = 5f * k;                 // 插件 .dshwv-trow 的 margin:5u
             // 对话中 / 等你决策 / 说骚话时不显示峰谷
-            bool showPeak = !_busy && !_waiting && string.IsNullOrEmpty(_quipText);
+            bool showPeak = !_waiting && string.IsNullOrEmpty(_quipText);
             float peakH = showPeak ? MeasurePeakRow(g, k) : 0f;
             float totalH = 0f;
             List<SizeF> sizes = new List<SizeF>();
@@ -969,11 +977,6 @@ namespace WhalePet
             if (_waiting)
             {
                 rows.Add(new TextRow("正在等待老大回答", _fontLabel, InkColor, 1.2f));
-                return rows;
-            }
-            if (_busy && (DateTime.Now - _busySince).TotalMinutes < 15)
-            {
-                rows.Add(new TextRow("消耗中…", _fontLabel, InkColor, 1.2f));
                 return rows;
             }
             if (!string.IsNullOrEmpty(_quipText) && _quipFont != null && _quipLines.Count > 0)
@@ -1121,6 +1124,11 @@ namespace WhalePet
                         if (!first && _turnCostOn) ShowTurnCost();
                     }
                 }
+                // 事件音效设置(插件 v0.4.2 用量账本 settings):taskEnd.on 默认开、question.soundOn 默认关
+                Match mt1 = Regex.Match(text, "\"taskEnd\"[^{]*\\{[^}]*\"on\"\\s*:\\s*(true|false)");
+                if (mt1.Success) _taskEndSoundOn = string.Equals(mt1.Groups[1].Value, "true", StringComparison.OrdinalIgnoreCase);
+                Match mq1 = Regex.Match(text, "\"question\"[^{]*\\{[^}]*\"soundOn\"\\s*:\\s*(true|false)");
+                if (mq1.Success) _questionSoundOn = string.Equals(mq1.Groups[1].Value, "true", StringComparison.OrdinalIgnoreCase);
             }
             catch (Exception ex) { Log.Write("usage read fail " + ex.Message); }
             _dirty = true;
@@ -1157,6 +1165,7 @@ namespace WhalePet
                 {
                     EnsureOnTop();
                     _bubbleUntil = DateTime.Now.AddSeconds(8);
+                    if (_questionSoundOn) PlayEventWav(_askWavPath);
                 }
             }
             catch { }
@@ -1172,10 +1181,27 @@ namespace WhalePet
                 Match m = Regex.Match(json, "\"seq\"\\s*:\\s*(\\d+)");
                 if (!m.Success) return;
                 long seq = long.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture);
-                if (seq == _lastTurnSeq) return;
-                bool first = _lastTurnSeq < 0;
-                _lastTurnSeq = seq;
-                if (!first) OnTurnStarted();
+
+                // busy 字段由 Claude Code hooks 写（start=true / stop=false）；DSH 不写这个字段
+                bool hasBusy = false, busyFlag = false;
+                Match mb = Regex.Match(json, "\"busy\"\\s*:\\s*(true|false)");
+                if (mb.Success)
+                {
+                    hasBusy = true;
+                    busyFlag = string.Equals(mb.Groups[1].Value, "true", StringComparison.OrdinalIgnoreCase);
+                }
+
+                if (seq != _lastTurnSeq)
+                {
+                    bool first = _lastTurnSeq < 0;
+                    _lastTurnSeq = seq;
+                    if (!first) OnTurnStarted();
+                }
+                if (hasBusy && seq == _lastTurnSeq)
+                {
+                    if (busyFlag && !_busy) OnTurnStarted();
+                    else if (!busyFlag && _busy) OnTurnStopped();
+                }
             }
             catch { }
         }
@@ -1185,9 +1211,21 @@ namespace WhalePet
             _dirty = true;
             _busy = true;
             _busySince = DateTime.Now;
+            Log.Write("turn start");
             if (!_autoShow) return;
             EnsureOnTop();
             _bubbleUntil = DateTime.Now.AddSeconds(10);
+            _bubbleOpen = 1f;   // 按下即出现:轮次触发跳过开合动画,文字立刻全显
+        }
+
+        private void OnTurnStopped()
+        {
+            if (!_busy) return;
+            _busy = false;
+            _dirty = true;
+            _bubbleUntil = DateTime.Now.AddSeconds(2);
+            Log.Write("turn stop");
+            if (_taskEndSoundOn) PlayEventWav(_evtWavPath);
         }
 
         private void EnsureOnTop()
@@ -1209,6 +1247,7 @@ namespace WhalePet
             int ms = Math.Max(1500, Math.Min(60000, _turnCostCloseMs));
             _turnUntil = DateTime.Now.AddMilliseconds(ms);
             _bubbleUntil = _turnUntil;
+            if (_taskEndSoundOn) PlayEventWav(_evtWavPath);
         }
 
         private void ShowBubble(int seconds)
@@ -1216,6 +1255,8 @@ namespace WhalePet
             RefreshUsage();
             _turnUntil = DateTime.MinValue;
             _bubbleUntil = DateTime.Now.AddSeconds(seconds);
+            _bubbleOpen = 1f;    // 按下即全显:所有路径零动画,文字立刻出现
+            _dirty = true;
         }
 
         #region 直连官网余额（api.deepseek.com/user/balance）
@@ -1349,16 +1390,43 @@ namespace WhalePet
             catch { }
         }
 
+        private static string[] PluginAudioCandidates(string file)
+        {
+            // 音效优先取 dsh-whale-widget 插件包(与 DSH 网页端同一份文件)
+            string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            return new[]
+            {
+                Path.Combine(home, ".dsh", "profiles", "desktop", "node_modules", "dsh-whale-widget", "assets", file),
+                Path.Combine(home, ".dsh", "profiles", "web", "node_modules", "dsh-whale-widget", "assets", file),
+                Path.Combine(AppDir, "assets", file),
+            };
+        }
+
+        private static string PickAudio(string file)
+        {
+            foreach (string p in PluginAudioCandidates(file))
+                if (File.Exists(p)) return p;
+            return Path.Combine(AppDir, "assets", file);
+        }
+
         private void InitAudio()
         {
             try
             {
-                string press = Path.Combine(AppDir, "assets", _soundSet == "fx1" ? "D1.mp3" : "Ya1.mp3");
-                string release = Path.Combine(AppDir, "assets", _soundSet == "fx1" ? "D2.mp3" : "Ya2.mp3");
+                string press = PickAudio(_soundSet == "fx1" ? "D1.mp3" : "Ya1.mp3");
+                string release = PickAudio(_soundSet == "fx1" ? "D2.mp3" : "Ya2.mp3");
                 if (!File.Exists(press) || !File.Exists(release)) { Log.Write("audio files missing"); return; }
 
-                int openPress = Native.mciSendString("open \"" + press + "\" type mpegvideo alias whalePress", null, 0, IntPtr.Zero);
-                int openRelease = OpenWmp(release);
+                // 事件音效(插件 v0.4.2 随包 wav):任务结束 cost_a / 提问 ask_a
+                _evtWavPath = PickAudio("cost-default.wav");
+                _askWavPath = PickAudio("ask-default.wav");
+                if (!File.Exists(_evtWavPath)) _evtWavPath = null;
+                if (!File.Exists(_askWavPath)) _askWavPath = null;
+
+                int openPress = Native.mciSendString("open \"" + press + "\" type mpegvideo alias whalePress", null, 0, IntPtr.Zero);   // 只用于量时长
+                int openRelease = OpenWmp(release, false);
+                int openPressWmp = OpenWmp(press, true);
+                Log.Write("audio open press mci=" + openPress + " wmpPress=" + openPressWmp + " wmpRelease=" + openRelease);
                 int vol = (int)Math.Round(1000 * _soundVolume);
                 Native.mciSendString("setaudio whalePress volume to " + vol, null, 0, IntPtr.Zero);
 
@@ -1367,6 +1435,7 @@ namespace WhalePet
                 int len;
                 if (int.TryParse(lenBuf.ToString(), out len) && len > 50) _pressLenMs = len;
                 _audioReady = true;
+                Log.Write("audio ok press=" + press + " evt=" + (_evtWavPath != null ? "cost_a" : "none"));
             }
             catch (Exception ex) { Log.Write("audio init fail " + ex.Message); }
         }
@@ -1374,22 +1443,37 @@ namespace WhalePet
         private Type _wmpType;
         private object _wmpControls;
         private Type _wmpControlsType;
+        private object _wmpPress;
+        private Type _wmpPressType;
+        private object _wmpPressControls;
+        private Type _wmpPressControlsType;
 
-        private int OpenWmp(string path)
+        private int OpenWmp(string path, bool press)
         {
             try
             {
-                _wmpType = Type.GetTypeFromProgID("WMPlayer.OCX.7") ?? Type.GetTypeFromProgID("WMPlayer.OCX");
-                if (_wmpType == null) { Log.Write("wmp not registered"); return -1; }
-                _wmp = Activator.CreateInstance(_wmpType);
-                _wmpType.InvokeMember("uiMode", BindingFlags.SetProperty, null, _wmp, new object[] { "invisible" });
-                _wmpType.InvokeMember("URL", BindingFlags.SetProperty, null, _wmp, new object[] { path });
-                object settings = _wmpType.InvokeMember("settings", BindingFlags.GetProperty, null, _wmp, null);
+                Type t = Type.GetTypeFromProgID("WMPlayer.OCX.7") ?? Type.GetTypeFromProgID("WMPlayer.OCX");
+                if (t == null) { Log.Write("wmp not registered"); return -1; }
+                object wmp = Activator.CreateInstance(t);
+                t.InvokeMember("uiMode", BindingFlags.SetProperty, null, wmp, new object[] { "invisible" });
+                t.InvokeMember("URL", BindingFlags.SetProperty, null, wmp, new object[] { path });
+                object settings = t.InvokeMember("settings", BindingFlags.GetProperty, null, wmp, null);
                 settings.GetType().InvokeMember("volume", BindingFlags.SetProperty, null, settings,
                     new object[] { (int)Math.Round(100 * _soundVolume) });
                 settings.GetType().InvokeMember("autoStart", BindingFlags.SetProperty, null, settings, new object[] { false });
-                _wmpControls = _wmpType.InvokeMember("controls", BindingFlags.GetProperty, null, _wmp, null);
-                if (_wmpControls != null) _wmpControlsType = _wmpControls.GetType();
+                object controls = t.InvokeMember("controls", BindingFlags.GetProperty, null, wmp, null);
+                if (press)
+                {
+                    _wmpPress = wmp; _wmpPressType = t;
+                    _wmpPressControls = controls;
+                    if (controls != null) _wmpPressControlsType = controls.GetType();
+                }
+                else
+                {
+                    _wmp = wmp; _wmpType = t;
+                    _wmpControls = controls;
+                    if (controls != null) _wmpControlsType = controls.GetType();
+                }
                 return 0;
             }
             catch (Exception ex) { Log.Write("wmp init fail " + ex.Message); return -1; }
@@ -1407,6 +1491,18 @@ namespace WhalePet
             catch (Exception ex) { Log.Write("wmp play fail " + ex.Message); }
         }
 
+        private void PlayWmpPress()
+        {
+            try
+            {
+                if (_wmpPress == null || _wmpPressType == null) return;
+                if (_wmpPressControls == null || _wmpPressControlsType == null) return;
+                _wmpPressControlsType.InvokeMember("currentPosition", BindingFlags.SetProperty, null, _wmpPressControls, new object[] { 0.0 });
+                _wmpPressControlsType.InvokeMember("play", BindingFlags.InvokeMethod, null, _wmpPressControls, null);
+            }
+            catch (Exception ex) { Log.Write("wmp press play fail " + ex.Message); }
+        }
+
         private void CloseAudio()
         {
             try
@@ -1419,6 +1515,7 @@ namespace WhalePet
 
         // 插件的时序：按下放 Ya1；点按时 Ya2 正好接在 Ya1 结束那一刻（不重叠）；
         // 按住超过 Ya1 时长则在松手时立刻放 Ya2。
+        // 按压音走 WMP(与松开音同一管线,绕开 MCI 播放不稳定的问题)
         private void PlayPress()
         {
             if (!_audioReady || !_soundOn || !_pressOn) return;
@@ -1426,19 +1523,31 @@ namespace WhalePet
             {
                 _pressAt = DateTime.Now;
                 if (_releaseTick != null) _releaseTick.Stop();
-                // MCI 命令是同步的，放后台线程发，别挡住动画
-                ThreadPool.QueueUserWorkItem(delegate
-                {
-                    try
-                    {
-                        Native.mciSendString("stop whalePress", null, 0, IntPtr.Zero);
-                        Native.mciSendString("seek whalePress to start", null, 0, IntPtr.Zero);
-                        Native.mciSendString("play whalePress", null, 0, IntPtr.Zero);
-                    }
-                    catch { }
-                });
+                PlayWmpPress();
             }
             catch (Exception ex) { Log.Write("press play fail " + ex.Message); }
+        }
+
+        // 事件音效(任务结束/提问):MCI waveaudio 后台播放,2 秒内去重
+        private void PlayEventWav(string path)
+        {
+            if (!_audioReady || !_soundOn || string.IsNullOrEmpty(path)) return;
+            if ((DateTime.Now - _lastEvtPlay).TotalSeconds < 2) return;
+            _lastEvtPlay = DateTime.Now;
+            string p = path;
+            double vol = _soundVolume;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    Native.mciSendString("close whaleEvt", null, 0, IntPtr.Zero);
+                    int open = Native.mciSendString("open \"" + p + "\" type waveaudio alias whaleEvt", null, 0, IntPtr.Zero);
+                    if (open != 0) return;
+                    Native.mciSendString("setaudio whaleEvt volume to " + (int)Math.Round(1000 * vol), null, 0, IntPtr.Zero);
+                    Native.mciSendString("play whaleEvt", null, 0, IntPtr.Zero);
+                }
+                catch { }
+            });
         }
 
         private const int ReleaseLeadMs = 40;   // 松开音提前 40ms 进场，跟 Ya1 尾音轻微交叠
@@ -1491,6 +1600,20 @@ namespace WhalePet
             api.Enabled = !string.IsNullOrEmpty(_apiKey);
             api.Click += delegate { _apiOn = !_apiOn; if (_apiOn) FetchBalance(); };
 
+            ToolStripMenuItem watchdog = new ToolStripMenuItem("退出后自动回来（看门狗）");
+            watchdog.Checked = IsWatchdogOn();
+            watchdog.Click += delegate {
+                try
+                {
+                    bool turnOn = !IsWatchdogOn();
+                    SetWatchdog(turnOn);
+                    MessageBox.Show(turnOn
+                        ? "已开启：每 5 分钟检查一次，没在跑就自动拉起来。\n关掉：再点一次这个菜单项。"
+                        : "已关闭自动复活。", "小鲸鱼");
+                }
+                catch (Exception ex) { Log.Write("watchdog menu fail " + ex.Message); }
+            };
+
             ToolStripMenuItem autoShow = new ToolStripMenuItem("消耗 API 时自动出现");
             autoShow.Checked = _autoShow;
             autoShow.Click += delegate { _autoShow = !_autoShow; };
@@ -1530,6 +1653,7 @@ namespace WhalePet
             menu.Items.Add(turnCost);
             menu.Items.Add(api);
             menu.Items.Add(autoShow);
+            menu.Items.Add(watchdog);
             menu.Items.Add(refresh);
             menu.Items.Add(size);
             menu.Items.Add(new ToolStripSeparator());
@@ -1541,6 +1665,50 @@ namespace WhalePet
             menu.Items.Add(quit);
 
             menu.Show(Cursor.Position);
+        }
+
+        private const string WatchdogTask = "DSHWhalePetWatchdog";
+
+        private static bool IsWatchdogOn()
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("schtasks", "/Query /TN " + WatchdogTask);
+                psi.CreateNoWindow = true;
+                psi.UseShellExecute = false;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (Process p = Process.Start(psi))
+                {
+                    p.StandardOutput.ReadToEnd();
+                    p.StandardError.ReadToEnd();
+                    p.WaitForExit(3000);
+                    return p.HasExited && p.ExitCode == 0;
+                }
+            }
+            catch { return false; }
+        }
+
+        private void SetWatchdog(bool on)
+        {
+            try
+            {
+                string args = on
+                    ? "/Create /TN " + WatchdogTask + " /TR \"" + Application.ExecutablePath + "\" /SC MINUTE /MO 5 /F"
+                    : "/Delete /TN " + WatchdogTask + " /F";
+                ProcessStartInfo psi = new ProcessStartInfo("schtasks", args);
+                psi.CreateNoWindow = true;
+                psi.UseShellExecute = false;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (Process p = Process.Start(psi))
+                {
+                    string outp = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+                    p.WaitForExit(4000);
+                    Log.Write("watchdog " + (on ? "on" : "off") + " exit=" + p.ExitCode + " " + outp.Trim());
+                }
+            }
+            catch (Exception ex) { Log.Write("watchdog fail " + ex.Message); }
         }
 
         private void CreateDesktopShortcut()
@@ -1589,6 +1757,7 @@ namespace WhalePet
                 _pressStarted = true;
                 _pressTarget = 1f;
                 PlayPress();
+                HandleClick();       // 按下瞬间就出气泡文字(原来要等松开)
                 _dragStart = Cursor.Position;
                 _winStart = Location;
             }
@@ -1751,14 +1920,12 @@ namespace WhalePet
             if (e.Button == MouseButtons.Left)
             {
                 bool wasDrag = _moved;
-                bool started = _pressStarted;
                 _pressTarget = 0f;
                 PlayRelease(true);
                 _dragging = false;
                 _moved = false;
                 _pressStarted = false;
                 if (wasDrag) { ClampToScreen(); SnapToEdges(); SaveConfig(); }
-                else if (started) HandleClick();
             }
             base.OnMouseUp(e);
         }
@@ -1790,7 +1957,7 @@ namespace WhalePet
             float btnTarget = (_showButton && !_dragging) ? 1f : 0f;
 
             // 指数逼近（时间常数），不会因为帧率变化而快慢不一
-            _bubbleOpen += (bubbleTarget - _bubbleOpen) * (1f - (float)Math.Exp(-dt / 0.045f));
+            _bubbleOpen += (bubbleTarget - _bubbleOpen) * (1f - (float)Math.Exp(-dt / 0.030f));
             if (Math.Abs(_bubbleOpen - bubbleTarget) < 0.004f) _bubbleOpen = bubbleTarget;
 
             _buttonAlpha += (btnTarget - _buttonAlpha) * (1f - (float)Math.Exp(-dt / 0.05f));
@@ -1833,6 +2000,8 @@ namespace WhalePet
 
         private void OnPollTick(object sender, EventArgs e)
         {
+            // 每 80ms 看一次轮次信号：消耗一开始就弹（原来只在 1s 的状态滴答里看，文字出来慢）
+            WatchTurn();
             if (_dragging) return;
             UpdateClickThrough();
         }
@@ -1843,7 +2012,6 @@ namespace WhalePet
             if (_tick % 5 == 0) RefreshUsage();
             if (_tick % 60 == 0) FetchBalance();
             WatchWaiting();
-            WatchTurn();
             if (_busy || _waiting) _bubbleUntil = DateTime.Now.AddSeconds(6);
         }
 

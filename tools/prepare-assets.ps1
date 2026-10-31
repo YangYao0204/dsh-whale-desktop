@@ -30,11 +30,13 @@ if (-not $PluginDir -or -not (Test-Path (Join-Path $PluginDir "DSniang1.png"))) 
 New-Item -ItemType Directory -Force -Path $assets | Out-Null
 
 $map = @{
-    "DSniang1.png" = "whale.png"
-    "Ya1.mp3"      = "Ya1.mp3"
-    "Ya2.mp3"      = "Ya2.mp3"
-    "D1.mp3"       = "D1.mp3"
-    "D2.mp3"       = "D2.mp3"
+    "DSniang1.png"     = "whale.png"
+    "Ya1.mp3"          = "Ya1.mp3"
+    "Ya2.mp3"          = "Ya2.mp3"
+    "D1.mp3"           = "D1.mp3"
+    "D2.mp3"           = "D2.mp3"
+    "cost-default.wav" = "cost-default.wav"
+    "ask-default.wav"  = "ask-default.wav"
 }
 
 foreach ($src in $map.Keys) {

@@ -38,7 +38,8 @@ if ($LASTEXITCODE -ne 0) {
 
 # 音效在运行时从磁盘读，跟 exe 放一起
 Copy-Item (Join-Path $root "assets\*.mp3") $dist -Force -ErrorAction SilentlyContinue
+Copy-Item (Join-Path $root "assets\*.wav") $dist -Force -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "完成：$out" -ForegroundColor Green
-Write-Host "把 dist 整个目录拷走即可使用（WhalePet.exe + *.mp3）" -ForegroundColor Gray
+Write-Host "把 dist 整个目录拷走即可使用（WhalePet.exe + 音效）" -ForegroundColor Gray
