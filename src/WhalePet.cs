@@ -13,6 +13,7 @@ using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.Globalization;
 using System.Net;
+using System.Net.Security;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -116,6 +117,43 @@ namespace WhalePet
 
         [DllImport("kernel32.dll")]
         public static extern bool CloseHandle(IntPtr hObject);
+
+        // ---- DeepSeek 网络检测(iphlpapi):枚举本机 TCP 表,看谁在跟 api.deepseek.com 通信 ----
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MIB_TCPROW_OWNER_PID
+        {
+            public uint dwState;
+            public uint dwLocalAddr;
+            public uint dwLocalPort;
+            public uint dwRemoteAddr;
+            public uint dwRemotePort;
+            public uint dwOwningPid;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MIB_TCP6ROW_OWNER_PID
+        {
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public byte[] ucLocalAddr;
+            public uint dwLocalScopeId;
+            public uint dwLocalPort;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public byte[] ucRemoteAddr;
+            public uint dwRemoteScopeId;
+            public uint dwRemotePort;
+            public uint dwState;
+            public uint dwOwningPid;
+        }
+
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        public static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int pdwSize,
+            bool bOrder, uint ulAf, int tableClass, uint reserved);
+
+        public const uint AF_INET = 2;
+        public const uint AF_INET6 = 23;
+        public const int TCP_TABLE_OWNER_PID_ALL = 5;
+        public const uint ERROR_SUCCESS = 0;
+        public const uint ERROR_INSUFFICIENT_BUFFER = 122;
+        public const uint MIB_TCP_STATE_ESTAB = 5;
     }
 
     internal static class Log
@@ -343,6 +381,42 @@ namespace WhalePet
         private string _turnAmount;
         private string _turnTokens;
         private string _turnModel;
+
+        // 「其他软件消耗 DeepSeek」网络检测,两个源:
+        //   A. 127.0.0.1:15721 的本地代理连接(cc-switch,其他软件走它必然经此;ESTATS 对出网
+        //      连接被加速器驱动吃掉了字节,localhost 不受影响)
+        //   B. 直连 api.deepseek.com 的 443 连接,远端 IP 须在已知节点集(官方 DNS 解析 + SNI 验证学到的)
+        private bool _netWatch = true;
+        private bool _netBusy;
+        private DateTime _netActiveSince = DateTime.MinValue;
+        private DateTime _netLastSeen = DateTime.MinValue;
+        private readonly object _netLock = new object();
+        private IPAddress[] _netIps;                 // DNS 解析基础集
+        private DateTime _netIpsStamp = DateTime.MinValue;
+        private bool _netResolving;
+        private int _netTickCount;
+        private readonly HashSet<string> _netKnown = new HashSet<string>(StringComparer.Ordinal);    // 已确认节点(持久化)
+        private readonly Dictionary<string, int> _netCandidates = new Dictionary<string, int>();
+        private readonly Queue<string> _netVerifyQueue = new Queue<string>();
+        private readonly HashSet<string> _netQueued = new HashSet<string>(StringComparer.Ordinal);
+        private readonly Dictionary<string, DateTime> _netBlacklist = new Dictionary<string, DateTime>();
+        private bool _netVerifyThreadStarted;
+        private static readonly int NetMinMs = GrabEnvInt("DSH_WHALE_NET_MIN_MS", 900);
+        private static readonly int NetQuietMs = GrabEnvInt("DSH_WHALE_NET_QUIET_MS", 2500);
+        private static readonly int NetLogMs = GrabEnvInt("DSH_WHALE_NET_LOG_MS", 30000);
+
+        // 源 C:cc-switch 日志(每笔经 15721 的请求都会写一行「请求目标」)
+        private string _ccLogPath;
+        private long _ccLogLen = -1;
+        private HashSet<string> _netPrevKeys = new HashSet<string>(StringComparer.Ordinal);   // 上 tick 已知节点连接集
+        private bool _netPrevReady;   // 首个 tick 只建基线,不把现有连接当“新连接”
+
+        // 排除的进程(加速器会自己建到 DeepSeek 节点的隧道连接,与真实请求无关):
+        // 命中它名的 PID 每 60s 刷新一次
+        private HashSet<int> _netExcludePids = new HashSet<int>();
+        private DateTime _netExcludeAt = DateTime.MinValue;
+        private bool _netExcludeRefreshing;
+        private static readonly string[] NetExcludeNames = { "kuaijiasu" };
         private readonly System.Text.StringBuilder _mciBuf = new System.Text.StringBuilder(256);
 
         public PetWindow()
@@ -1206,6 +1280,360 @@ namespace WhalePet
             catch { }
         }
 
+        #region 网络检测:其他软件消耗 DeepSeek(直连/走本地代理,流量都出网到 api.deepseek.com)
+
+        private static int GrabEnvInt(string name, int fallback)
+        {
+            try
+            {
+                string v = Environment.GetEnvironmentVariable(name);
+                int n;
+                if (!string.IsNullOrEmpty(v) && int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) return n;
+            }
+            catch { }
+            return fallback;
+        }
+
+        // DNS 每 20s 后台刷一次(CDN 节点轮询会换,多刷几轮覆盖全池),结果并入已知节点集
+        private void EnsureNetIps()
+        {
+            if (_netResolving) return;
+            if (_netIps != null && (DateTime.UtcNow - _netIpsStamp).TotalSeconds < 20) return;
+            _netResolving = true;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    IPAddress[] ips = Dns.GetHostAddresses("api.deepseek.com");
+                    if (ips != null && ips.Length > 0)
+                    {
+                        lock (_netLock)
+                        {
+                            _netIps = ips;
+                            _netIpsStamp = DateTime.UtcNow;
+                            foreach (IPAddress ip in ips)
+                                if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                                    _netKnown.Add(ip.ToString());
+                        }
+                        Log.Write("net ips refreshed count=" + ips.Length);
+                    }
+                }
+                catch { }
+                _netResolving = false;
+            });
+        }
+
+        private static string IpString4(uint addr)
+        {
+            byte[] b = BitConverter.GetBytes(addr);   // little-endian 内存布局 == 网络序的 IP 字节
+            return b[0] + "." + b[1] + "." + b[2] + "." + b[3];
+        }
+
+        private bool IsKnownIp4(uint addr)
+        {
+            lock (_netLock) { return _netKnown.Contains(IpString4(addr)); }
+        }
+
+        private static bool IsLoopback4(uint addr)
+        {
+            byte[] b = BitConverter.GetBytes(addr);
+            return b[0] == 127;
+        }
+
+        private static bool IsLoopback6(byte[] addr)
+        {
+            if (addr == null || addr.Length != 16) return false;
+            for (int i = 0; i < 15; i++) if (addr[i] != 0) return false;
+            return addr[15] == 1;   // ::1
+        }
+
+        // GetExtendedTcpTable 文档写端口是网络字节序,但不同版本实现不一,两种字节序都认
+        private static bool IsHttpsPort(uint port)
+        {
+            return port == 443 || port == 47873;
+        }
+
+        // CC Switch 本地代理端口:15721(主机序)与 26941(网络序)
+        private static bool IsPort15721(uint port)
+        {
+            return port == 15721 || port == 26941;
+        }
+
+        // 加速器/代理类进程每 60s 刷新一次排除 PID 集(后台线程,不卡 UI)
+        private void RefreshExcludePids()
+        {
+            if (_netExcludeRefreshing) return;
+            if ((DateTime.Now - _netExcludeAt).TotalSeconds < 60) return;
+            _netExcludeRefreshing = true;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    HashSet<int> pids = new HashSet<int>();
+                    foreach (Process proc in Process.GetProcesses())
+                    {
+                        string name = (proc.ProcessName ?? "").ToLowerInvariant();
+                        foreach (string ex in NetExcludeNames)
+                        {
+                            if (name.IndexOf(ex, StringComparison.Ordinal) >= 0)
+                            {
+                                pids.Add(proc.Id);
+                                break;
+                            }
+                        }
+                    }
+                    _netExcludePids = pids;
+                    _netExcludeAt = DateTime.Now;
+                }
+                catch { }
+                _netExcludeRefreshing = false;
+            });
+        }
+
+        private void WatchNet()
+        {
+            try
+            {
+                EnsureNetIps();
+                RefreshExcludePids();
+                int myPid = Process.GetCurrentProcess().Id;
+                int rowSize = Marshal.SizeOf(typeof(Native.MIB_TCPROW_OWNER_PID));
+                HashSet<string> curKeys = new HashSet<string>(StringComparer.Ordinal);
+
+                // ---- IPv4 ----
+                int size = 0;
+                uint ret = Native.GetExtendedTcpTable(IntPtr.Zero, ref size, false, Native.AF_INET, Native.TCP_TABLE_OWNER_PID_ALL, 0);
+                if (ret == Native.ERROR_INSUFFICIENT_BUFFER && size > 0)
+                {
+                    IntPtr buf = Marshal.AllocHGlobal(size);
+                    try
+                    {
+                        ret = Native.GetExtendedTcpTable(buf, ref size, false, Native.AF_INET, Native.TCP_TABLE_OWNER_PID_ALL, 0);
+                        if (ret == Native.ERROR_SUCCESS)
+                        {
+                            int count = Marshal.ReadInt32(buf);
+                            for (int i = 0; i < count; i++)
+                            {
+                                IntPtr p = new IntPtr(buf.ToInt64() + 4 + (long)i * rowSize);
+                                Native.MIB_TCPROW_OWNER_PID row = (Native.MIB_TCPROW_OWNER_PID)Marshal.PtrToStructure(p, typeof(Native.MIB_TCPROW_OWNER_PID));
+                                if (row.dwOwningPid == myPid) continue;
+                                if (row.dwState != Native.MIB_TCP_STATE_ESTAB) continue;
+                                if (_netExcludePids.Contains((int)row.dwOwningPid)) continue;   // 加速器自身隧道
+                                if (!IsHttpsPort(row.dwRemotePort)) continue;
+
+                                // 源 B:直连已确认的 DeepSeek 节点;「新出现」的连接才算请求活动
+                                // (常驻 keep-alive 连接不算,否则鲸鱼会一直挂着)
+                                if (IsKnownIp4(row.dwRemoteAddr))
+                                {
+                                    string key = IpString4(row.dwRemoteAddr) + "|" + row.dwOwningPid + "|" + row.dwRemotePort;
+                                    curKeys.Add(key);
+                                    if (_netPrevReady && !_netPrevKeys.Contains(key)) _netLastSeen = DateTime.Now;
+                                    continue;
+                                }
+                                // 未知节点:进候选,等待 SNI 验证
+                                NoteCandidate4(row.dwRemoteAddr);
+                            }
+                        }
+                    }
+                    finally { Marshal.FreeHGlobal(buf); }
+                }
+
+                lock (_netLock) { _netPrevKeys = curKeys; _netPrevReady = true; }
+
+                // 源 C:cc-switch 日志增长 = 有软件经 15721 发请求(每笔请求一行)
+                if (WatchCcLog()) _netLastSeen = DateTime.Now;
+                bool anyActive = (DateTime.Now - _netLastSeen).TotalMilliseconds < NetLogMs;
+
+                UpdateNetState(anyActive);
+                StartVerifierIfNeeded();
+            }
+            catch (Exception ex) { Log.Write("net watch fail " + ex.Message); }
+        }
+
+        // cc-switch 日志每笔请求写一行;文件变大 = 有新请求。首次调用只记基线不触发。
+        private bool WatchCcLog()
+        {
+            try
+            {
+                if (_ccLogPath == null)
+                {
+                    _ccLogPath = Environment.GetEnvironmentVariable("DSH_WHALE_CCLOG");
+                    if (string.IsNullOrEmpty(_ccLogPath))
+                        _ccLogPath = Path.Combine(
+                            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                            ".cc-switch", "logs", "cc-switch.log");
+                }
+                if (!File.Exists(_ccLogPath)) return false;
+                long len = new FileInfo(_ccLogPath).Length;
+                if (_ccLogLen < 0) { _ccLogLen = len; return false; }
+                bool grew = len > _ccLogLen;
+                _ccLogLen = len;
+                return grew;
+            }
+            catch { return false; }
+        }
+
+        // 候选:未知的 443 远端 IP,出现 2 次(>=1s)以上就排队验证
+        private void NoteCandidate4(uint addr)
+        {
+            string ip = IpString4(addr);
+            if (ip == "0.0.0.0" || ip.StartsWith("10.", StringComparison.Ordinal)
+                || ip.StartsWith("192.168.", StringComparison.Ordinal)
+                || ip.StartsWith("172.16.", StringComparison.Ordinal)
+                || ip.StartsWith("172.17.", StringComparison.Ordinal)
+                || ip.StartsWith("172.18.", StringComparison.Ordinal)
+                || ip.StartsWith("172.19.", StringComparison.Ordinal)
+                || ip.StartsWith("172.2", StringComparison.Ordinal)
+                || ip.StartsWith("172.3", StringComparison.Ordinal)
+                || ip.StartsWith("169.254.", StringComparison.Ordinal)
+                || ip.StartsWith("100.64.", StringComparison.Ordinal)
+                || ip.StartsWith("127.", StringComparison.Ordinal)) return;
+            lock (_netLock)
+            {
+                if (_netKnown.Contains(ip)) return;
+                DateTime bl;
+                if (_netBlacklist.TryGetValue(ip, out bl) && (DateTime.UtcNow - bl).TotalHours < 24) return;
+                int n;
+                _netCandidates.TryGetValue(ip, out n);
+                n++;
+                _netCandidates[ip] = n;
+                if (n >= 2 && !_netQueued.Contains(ip) && _netVerifyQueue.Count < 60)
+                {
+                    _netQueued.Add(ip);
+                    _netVerifyQueue.Enqueue(ip);
+                }
+            }
+        }
+
+        private void StartVerifierIfNeeded()
+        {
+            if (_netVerifyThreadStarted) return;
+            _netVerifyThreadStarted = true;
+            Thread t = new Thread(VerifyLoop);
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        // 后台验证:对候选 IP 发 https://IP/ 并把 SNI/Host 设为 api.deepseek.com,
+        // 只有真正的 DeepSeek CDN 节点会返回 API 风格的 JSON(error 字段),EdgeOne 其他节点
+        // 返回 "conf not found"。验证通过的进 _netKnown 并持久化;失败进 24h 黑名单。
+        private void VerifyLoop()
+        {
+            while (true)
+            {
+                string ip = null;
+                lock (_netLock)
+                {
+                    if (_netVerifyQueue.Count > 0) ip = _netVerifyQueue.Dequeue();
+                }
+                if (ip == null) { Thread.Sleep(3000); continue; }
+                bool ok;
+                try { ok = ProbeDeepSeek(ip); }
+                catch { ok = false; }
+                lock (_netLock)
+                {
+                    _netQueued.Remove(ip);
+                    _netCandidates.Remove(ip);
+                    if (ok)
+                    {
+                        if (!_netKnown.Contains(ip)) { _netKnown.Add(ip); SaveConfig(); }
+                        Log.Write("net node verified " + ip);
+                    }
+                    else
+                    {
+                        _netBlacklist[ip] = DateTime.UtcNow;
+                        Log.Write("net node rejected " + ip);
+                    }
+                }
+                Thread.Sleep(5000);   // 限流:5s 验证一个
+            }
+        }
+
+        private static bool ProbeDeepSeek(string ip)
+        {
+            RemoteCertificateValidationCallback oldCb = ServicePointManager.ServerCertificateValidationCallback;
+            try
+            {
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+                ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create("https://" + ip + "/");
+                req.Host = "api.deepseek.com";
+                req.Timeout = 6000;
+                req.ReadWriteTimeout = 6000;
+                req.UserAgent = "DSH-WhalePet/1.0";
+                try
+                {
+                    using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                    using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    {
+                        return BodyLooksDeepSeek(sr.ReadToEnd());
+                    }
+                }
+                catch (WebException ex)
+                {
+                    HttpWebResponse resp = ex.Response as HttpWebResponse;
+                    if (resp == null) return false;
+                    int code = (int)resp.StatusCode;
+                    if (code != 400 && code != 401 && code != 403 && code != 404) return false;
+                    using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    {
+                        return BodyLooksDeepSeek(sr.ReadToEnd());
+                    }
+                }
+            }
+            catch { return false; }
+            finally
+            {
+                ServicePointManager.ServerCertificateValidationCallback = oldCb;
+            }
+        }
+
+        private static bool BodyLooksDeepSeek(string body)
+        {
+            if (string.IsNullOrEmpty(body)) return false;
+            if (body.IndexOf("conf not found", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+            if (body.IndexOf("Not Allowed", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+            return body.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0
+                || body.IndexOf("deepseek", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // 活动持续超过 NetMinMs 才确认“在消耗”(挡掉瞬时查询);已 busy 后静默超过
+        // NetQuietMs 才收。活动迹象(日志新行/新连接)由 WatchNet 直接刷 _netLastSeen,
+        // 这里不能再刷,否则活动窗口永不结束。
+        private void UpdateNetState(bool anyActive)
+        {
+            DateTime now = DateTime.Now;
+            if (anyActive)
+            {
+                if (_netActiveSince == DateTime.MinValue) _netActiveSince = now;
+            }
+            else
+            {
+                _netActiveSince = DateTime.MinValue;
+            }
+
+            if (_netBusy)
+            {
+                if (!anyActive && (now - _netLastSeen).TotalMilliseconds > NetQuietMs)
+                {
+                    _netBusy = false;
+                    Log.Write("net turn stop");
+                    if (!_busy) EndTurnVisual();
+                }
+            }
+            else
+            {
+                if (anyActive && (now - _netActiveSince).TotalMilliseconds >= NetMinMs)
+                {
+                    _netBusy = true;
+                    Log.Write("net turn start");
+                    if (!_busy && _autoShow) ShowForTurn();
+                }
+            }
+        }
+
+        #endregion
+
         private void OnTurnStarted()
         {
             _dirty = true;
@@ -1213,9 +1641,16 @@ namespace WhalePet
             _busySince = DateTime.Now;
             Log.Write("turn start");
             if (!_autoShow) return;
+            ShowForTurn();
+        }
+
+        // 弹出视觉(hooks 与网络检测共用)
+        private void ShowForTurn()
+        {
             EnsureOnTop();
             _bubbleUntil = DateTime.Now.AddSeconds(10);
             _bubbleOpen = 1f;   // 按下即出现:轮次触发跳过开合动画,文字立刻全显
+            _dirty = true;
         }
 
         private void OnTurnStopped()
@@ -1223,8 +1658,15 @@ namespace WhalePet
             if (!_busy) return;
             _busy = false;
             _dirty = true;
-            _bubbleUntil = DateTime.Now.AddSeconds(2);
             Log.Write("turn stop");
+            if (_netBusy) return;   // hooks 结束了但其他软件还在消耗,不收
+            EndTurnVisual();
+        }
+
+        private void EndTurnVisual()
+        {
+            _bubbleUntil = DateTime.Now.AddSeconds(2);
+            _dirty = true;
             if (_taskEndSoundOn) PlayEventWav(_evtWavPath);
         }
 
@@ -1618,6 +2060,10 @@ namespace WhalePet
             autoShow.Checked = _autoShow;
             autoShow.Click += delegate { _autoShow = !_autoShow; };
 
+            ToolStripMenuItem netWatch = new ToolStripMenuItem("其他软件消耗也弹出（网络检测）");
+            netWatch.Checked = _netWatch;
+            netWatch.Click += delegate { _netWatch = !_netWatch; SaveConfig(); };
+
             ToolStripMenuItem refresh = new ToolStripMenuItem("刷新余额");
             refresh.Click += delegate { RefreshUsage(); FetchBalance(); ShowBubble(8); };
 
@@ -1653,6 +2099,7 @@ namespace WhalePet
             menu.Items.Add(turnCost);
             menu.Items.Add(api);
             menu.Items.Add(autoShow);
+            menu.Items.Add(netWatch);
             menu.Items.Add(watchdog);
             menu.Items.Add(refresh);
             menu.Items.Add(size);
@@ -2002,6 +2449,8 @@ namespace WhalePet
         {
             // 每 80ms 看一次轮次信号：消耗一开始就弹（原来只在 1s 的状态滴答里看，文字出来慢）
             WatchTurn();
+            // 每 500ms 看一次网络：其他软件(直连/走代理)消耗 DeepSeek 也弹
+            if (_netWatch && (++_netTickCount % 10) == 0) WatchNet();
             if (_dragging) return;
             UpdateClickThrough();
         }
@@ -2012,7 +2461,7 @@ namespace WhalePet
             if (_tick % 5 == 0) RefreshUsage();
             if (_tick % 60 == 0) FetchBalance();
             WatchWaiting();
-            if (_busy || _waiting) _bubbleUntil = DateTime.Now.AddSeconds(6);
+            if (_busy || _waiting || _netBusy) _bubbleUntil = DateTime.Now.AddSeconds(6);
         }
 
         private void UpdateClickThrough()
@@ -2285,6 +2734,13 @@ namespace WhalePet
                 }
                 _cfg.TopMost = GrabBool(json, "topMost", true);
                 _cfg.Flipped = GrabBool(json, "flipped", false);
+                _netWatch = GrabBool(json, "netWatch", true);
+                Match mi = Regex.Match(json, "\"netIps\"\\s*:\\s*\\[([^\\]]*)\\]");
+                if (mi.Success)
+                {
+                    foreach (Match m in Regex.Matches(mi.Groups[1].Value, "\"([0-9.]+)\""))
+                        _netKnown.Add(m.Groups[1].Value);
+                }
             }
             catch { }
         }
@@ -2300,8 +2756,12 @@ namespace WhalePet
                 sb.AppendLine("  \"x\": " + _cfg.X + ",");
                 sb.AppendLine("  \"y\": " + _cfg.Y + ",");
                 sb.AppendLine("  \"scale\": " + _cfg.Scale.ToString("0.00", CultureInfo.InvariantCulture) + ",");
-                sb.AppendLine("  \"topMost\": " + (_cfg.TopMost ? "true" : "false"));
-                sb.AppendLine("  \"flipped\": " + (_flipped ? "true" : "false"));
+                sb.AppendLine("  \"topMost\": " + (_cfg.TopMost ? "true" : "false") + ",");
+                sb.AppendLine("  \"flipped\": " + (_flipped ? "true" : "false") + ",");
+                sb.AppendLine("  \"netWatch\": " + (_netWatch ? "true" : "false") + ",");
+                string[] known;
+                lock (_netLock) { known = new string[_netKnown.Count]; _netKnown.CopyTo(known); }
+                sb.AppendLine("  \"netIps\": [" + string.Join(",", Array.ConvertAll(known, x => "\"" + x + "\"")) + "]");
                 sb.AppendLine("}");
                 File.WriteAllText(ConfigPath, sb.ToString(), new UTF8Encoding(false));
             }

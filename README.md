@@ -19,7 +19,7 @@
 - **峰谷实时**：工作日 9–12 / 14–18 为峰，其余、周末、法定节假日为谷；倒计时跨天不清零。
 - **每轮消耗**：读 DSH 账本里的逐轮事件，回合结束自动弹「本轮消耗 ¥x / n tokens」。
 - **等你决策**：读 DSH 会话缓存里的 `questions.active`，有挂起问题就显示「正在等待老大回答」并置顶。
-- **消耗 API 时自动出现**：`~/.dsh/.dshw-turn.json` 的 `seq` 或 `busy` 字段一变就置顶冒出，结束 2 秒后收起（默认开，可在菜单关）。DSH 侧由插件自动写 `seq`；Claude Code 侧可用两个 hook 写 `busy`（见下方「Claude Code 联动」）。
+- **消耗 API 时自动出现**：`~/.dsh/.dshw-turn.json` 的 `seq` 或 `busy` 字段一变就置顶冒出，结束 2 秒后收起（默认开，可在菜单关）。DSH 侧由插件自动写 `seq`；Claude Code 侧可用两个 hook 写 `busy`（见下方「Claude Code 联动」）；**其他软件消耗 DeepSeek**（直连官方或经 CC Switch 代理）由内置网络检测捕获（见下方「其他软件联动」）。
 - **按压手感**：整只挂件 `scaleY .88 / scaleX 1.05`（原点在底部中心），SmoothDamp 临界阻尼 + 1ms 定时器精度；**按下瞬间气泡文字即全显**（无开合动画，轮次弹出同理）。
 - **贴边吸附 + 贴左镜像**：拖到屏幕四边 26px 内自动吸附；贴左时只镜像立绘与泡泡，**文字保持正向可读**。
 - **手形光标**：悬停是张开的手，按下变握拳（运行时生成 32/48/64 多尺寸 `.cur`）。
@@ -31,7 +31,7 @@
 1. 双击 `WhalePet.exe`（首次运行会写「开机自启」，可在右键菜单关）。
 2. 需要 **.NET Framework 4.8**（Windows 10/11 自带）。
 
-菜单：每轮消耗提示 · 直连官网刷新余额 · 消耗 API 时自动出现 · 退出后自动回来（看门狗）· 刷新余额 · 大小 · 始终置顶 · 开机自启 · 在桌面创建快捷方式 · 回到右下角 · 退出。
+菜单：每轮消耗提示 · 直连官网刷新余额 · 消耗 API 时自动出现 · 其他软件消耗也弹出（网络检测）· 退出后自动回来（看门狗）· 刷新余额 · 大小 · 始终置顶 · 开机自启 · 在桌面创建快捷方式 · 回到右下角 · 退出。
 
 ## 构建
 
@@ -87,6 +87,15 @@ powershell -ExecutionPolicy Bypass -File tools\build.ps1
 `start` = `seq+1` 且 `busy:true`（鲸鱼立刻冒出，气泡显示余额卡）；`stop` = `busy:false`（2 秒后收起）。DSH 自己写 `seq` 不带 `busy`，互不干扰。
 
 **鲸鱼被退出后，下一次消耗 API 会自动把它拉起来**：`WhaleSignal` 在写信号前会检查鲸鱼的互斥体，没在跑就从自启注册表项 `DSHWhalePet` 找到 exe 直接启动（找不到再回退到 `Documents\deepseek-harness\default-workspace\desktop-whale\WhalePet.exe`），随后鲸鱼读到 `busy:true` 立即弹出。
+
+## 其他软件联动（网络检测）
+
+没有 Claude Code hooks 的其他软件（直连 `api.deepseek.com` 或走 CC Switch 本地代理 15721）消耗 DeepSeek 时，鲸鱼也能自动弹出（菜单项「其他软件消耗也弹出（网络检测）」，默认开）：
+
+1. **经 CC Switch（15721）**：监视 `%USERPROFILE%\.cc-switch\logs\cc-switch.log`，每笔请求都会写一行「请求目标」，新行出现即触发（活动窗口 30s，环境变量 `DSH_WHALE_NET_LOG_MS` 可调）。
+2. **直连官方**：每 500ms 枚举本机 TCP 表，发现「新出现」的到已知 DeepSeek 节点的 443 连接即触发。已知节点集 = 官方 DNS 解析（每 20s 刷一次）+ **SNI 探测验证**（对未知候选 IP 发 `Host: api.deepseek.com` 的 HTTPS 请求，只有返回 API 风格 JSON 的 CDN 节点才会被收入，EdgeOne 其他站点返回 `conf not found` 会被拒），验证结果持久化到 `whale-pet.json` 的 `netIps`，重启不丢。
+
+调参环境变量（启动时生效）：`DSH_WHALE_NET_MIN_MS`（活动确认门槛，默认 900）、`DSH_WHALE_NET_QUIET_MS`（静默收起，默认 2500）、`DSH_WHALE_NET_LOG_MS`（日志活动窗口，默认 30000）、`DSH_WHALE_CCLOG`（cc-switch 日志路径）。
 
 ## 许可
 
