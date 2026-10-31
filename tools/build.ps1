@@ -40,6 +40,19 @@ if ($LASTEXITCODE -ne 0) {
 Copy-Item (Join-Path $root "assets\*.mp3") $dist -Force -ErrorAction SilentlyContinue
 Copy-Item (Join-Path $root "assets\*.wav") $dist -Force -ErrorAction SilentlyContinue
 
+# WhaleSignal.exe：Claude Code hooks 信号助手（控制台程序，启动 <100ms）
+$signalSrc = Join-Path $root "signal\WhaleSignal.cs"
+$signalOut = Join-Path $dist "WhaleSignal.exe"
+& $csc /nologo /target:exe /platform:anycpu /optimize+ /codepage:65001 `
+    "/out:$signalOut" `
+    /r:System.dll `
+    "$signalSrc"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "WhaleSignal 编译失败" -ForegroundColor Red
+    exit $LASTEXITCODE
+}
+
 Write-Host ""
 Write-Host "完成：$out" -ForegroundColor Green
-Write-Host "把 dist 整个目录拷走即可使用（WhalePet.exe + 音效）" -ForegroundColor Gray
+Write-Host "完成：$signalOut" -ForegroundColor Green
+Write-Host "把 dist 整个目录拷走即可使用（WhalePet.exe + WhaleSignal.exe + 音效）" -ForegroundColor Gray

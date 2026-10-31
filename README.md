@@ -70,18 +70,23 @@ powershell -ExecutionPolicy Bypass -File tools\build.ps1
 
 ## Claude Code 联动
 
-在 Claude Code 里消耗 DeepSeek API 时（如经 CC Switch 代理），加两个 hook 让鲸鱼同样冒出来。写 `~/.dsh/.dshw-turn.json` 的 `seq`/`busy` 字段即可——可用任何方式写，示例（`settings.json`，配合一个读写该文件的小程序或脚本）：
+在 Claude Code 里消耗 DeepSeek API 时（如经 CC Switch 代理），加两个 hook 让鲸鱼同样冒出来。仓库自带现成的信号小程序 `signal\WhaleSignal.cs`（`tools\build.ps1` 会顺带编译出 `dist\WhaleSignal.exe`，或单独跑 `signal\build.bat`）：
+
+1. 把 `WhaleSignal.exe` 放到 `%USERPROFILE%\.dsh\whale-signal\`（或任意固定位置）
+2. 在 `%USERPROFILE%\.claude\settings.json` 里加：
 
 ```json
 {
   "hooks": {
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "<你的信号程序> start" }] }],
-    "Stop": [{ "hooks": [{ "type": "command", "command": "<你的信号程序> stop" }] }]
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "C:\\Users\\<你>\\.dsh\\whale-signal\\WhaleSignal.exe", "args": ["start"] }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "C:\\Users\\<你>\\.dsh\\whale-signal\\WhaleSignal.exe", "args": ["stop"] }] }]
   }
 }
 ```
 
 `start` = `seq+1` 且 `busy:true`（鲸鱼立刻冒出，气泡显示余额卡）；`stop` = `busy:false`（2 秒后收起）。DSH 自己写 `seq` 不带 `busy`，互不干扰。
+
+**鲸鱼被退出后，下一次消耗 API 会自动把它拉起来**：`WhaleSignal` 在写信号前会检查鲸鱼的互斥体，没在跑就从自启注册表项 `DSHWhalePet` 找到 exe 直接启动（找不到再回退到 `Documents\deepseek-harness\default-workspace\desktop-whale\WhalePet.exe`），随后鲸鱼读到 `busy:true` 立即弹出。
 
 ## 许可
 
