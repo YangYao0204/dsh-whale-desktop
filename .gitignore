@@ -1,0 +1,12 @@
+# 构建产物
+dist/
+assets/whale.png
+assets/*.mp3
+
+# 运行时状态
+whale-pet.json
+whale-pet.log
+
+# 系统
+Thumbs.db
+desktop.ini
